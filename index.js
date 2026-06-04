@@ -29,122 +29,235 @@ const NODOS_REPLICAS = [
 ];
 
 // Guardar en log de replicación
-async function guardarLog(tabla, operacion, datos) {
+async function guardarLog(tabla, operacion, datos, nodoOrigen = null) {
   try {
-    await pool.query(
-      `INSERT INTO log_replicacion (tabla, operacion, datos, nodo_origen)
-       VALUES ($1, $2, $3, $4)`,
-      [tabla, operacion, JSON.stringify(datos), NODO_NOMBRE]
+    const origen = nodoOrigen || NODO_NOMBRE;
+    const result = await pool.query(
+      `INSERT INTO log_replicacion (tabla, operacion, datos, nodo_origen, creado_en)
+       VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
+      [tabla, operacion, JSON.stringify(datos), origen]
     );
+    console.log(`📝 Log guardado [${origen}]: ${tabla} - ${operacion} (ID: ${result.rows[0].id})`);
+    return result.rows[0].id;
   } catch (err) {
-    console.warn('Error guardando log:', err.message);
+    console.error('❌ Error guardando log:', err.message);
+    return null;
   }
 }
 
 // Replicar a otros nodos
-async function replicarANodos(endpoint, datos) {
-  for (const nodo of NODOS_REPLICAS) {
-    try {
-      await fetch(`${nodo}${endpoint}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Replicacion': 'true'
-        },
-        body: JSON.stringify(datos),
-        signal: AbortSignal.timeout(3000)
-      });
-      console.log(`Replicado a ${nodo}${endpoint}`);
-    } catch (err) {
-      console.warn(`Error replicando a ${nodo}: ${err.message}`);
-    }
-  }
-}
-
-// Sincronización al arrancar - pedir cambios perdidos
-async function sincronizarAlArrancar() {
-  console.log('Iniciando sincronización post-arranque...');
+async function replicarANodos(endpoint, datos, tabla, operacion) {
+  console.log(`📤 Replicando ${tabla} - ${operacion} a ${NODOS_REPLICAS.length} nodos...`);
   
   for (const nodo of NODOS_REPLICAS) {
     try {
-      // Obtener el timestamp del último registro en nuestro log
-      const ultimoLog = await pool.query(
-        `SELECT MAX(creado_en) as ultimo FROM log_replicacion WHERE nodo_origen != $1`,
-        [NODO_NOMBRE]
-      );
-      
-      const desde = ultimoLog.rows[0].ultimo ?? '2024-01-01T00:00:00Z';
-      
-      const response = await fetch(`${nodo}/api/replicacion/sync?desde=${desde}&nodo=${NODO_NOMBRE}`, {
+      const response = await fetch(`${nodo.url}${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Replicacion': 'true',
+          'X-Nodo-Origen': NODO_NOMBRE
+        },
+        body: JSON.stringify(datos),
         signal: AbortSignal.timeout(5000)
       });
-      
-      if (!response.ok) continue;
-      
-      const cambios = await response.json();
-      
-      if (cambios.length === 0) {
-        console.log(`Sin cambios pendientes de ${nodo}`);
-        continue;
+
+      if (response.ok) {
+        console.log(`✅ Replicado a ${nodo.nombre} (${nodo.url})`);
+      } else {
+        console.log(`⚠️ Error en ${nodo.nombre}: ${response.status}`);
       }
-      
-      console.log(`Aplicando ${cambios.length} cambios de ${nodo}`);
-      
-      for (const cambio of cambios) {
-        await aplicarCambio(cambio);
-      }
-      
-      console.log(`Sincronización completada con ${nodo}`);
     } catch (err) {
-      console.warn(`No se pudo sincronizar con ${nodo}: ${err.message}`);
+      console.error(`❌ Error replicando a ${nodo.nombre}:`, err.message);
     }
   }
 }
 
-// Aplicar un cambio del log
-async function aplicarCambio(cambio) {
+// Obtener el último log de un nodo específico
+async function obtenerUltimoLogDeNodo(nodoNombre) {
+  const result = await pool.query(
+    `SELECT MAX(creado_en) as ultimo 
+     FROM log_replicacion 
+     WHERE nodo_origen = $1`,
+    [nodoNombre]
+  );
+  return result.rows[0].ultimo || new Date('2024-01-01');
+}
+
+// Sincronización completa con todos los nodos
+async function sincronizarConTodosLosNodos() {
+  console.log('\n🔄 INICIANDO SINCRONIZACIÓN COMPLETA...');
+  
+  for (const nodo of NODOS_REPLICAS) {
+    await sincronizarConNodo(nodo);
+  }
+  
+  console.log('✅ SINCRONIZACIÓN COMPLETADA\n');
+}
+
+// Sincronizar con un nodo específico
+async function sincronizarConNodo(nodo) {
   try {
-    if (cambio.tabla === 'resenas') {
-      const d = cambio.datos;
-      await pool.query(
-        `INSERT INTO resenas (lugar_id, usuario_id, titulo, comentario, estrellas)
-         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
-        [d.lugar_id, d.usuario_id, d.titulo, d.comentario, d.estrellas]
+    console.log(`\n📡 Sincronizando con ${nodo.nombre}...`);
+    
+    // Obtener la fecha del último log que tenemos de este nodo
+    const ultimoLog = await obtenerUltimoLogDeNodo(nodo.nombre);
+    const desde = ultimoLog.toISOString();
+    
+    console.log(`   Último log de ${nodo.nombre}: ${desde}`);
+    
+    // Solicitar logs nuevos al nodo
+    const response = await fetch(`${nodo.url}/api/replicacion/sync?desde=${encodeURIComponent(desde)}&nodo=${NODO_NOMBRE}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(10000)
+    });
+    
+    if (!response.ok) {
+      console.log(`   ❌ Error ${response.status} al sincronizar con ${nodo.nombre}`);
+      return;
+    }
+    
+    const logs = await response.json();
+    
+    if (logs.length === 0) {
+      console.log(`   ✅ No hay logs nuevos de ${nodo.nombre}`);
+      return;
+    }
+    
+    console.log(`   📥 Recibidos ${logs.length} logs nuevos de ${nodo.nombre}`);
+    
+    // Aplicar cada log
+    for (const log of logs) {
+      await aplicarLogRecibido(log);
+    }
+    
+    console.log(`   ✅ Sincronización con ${nodo.nombre} completada`);
+    
+  } catch (err) {
+    console.error(`   ❌ Error sincronizando con ${nodo.nombre}:`, err.message);
+  }
+}
+
+// Aplicar un log recibido de otro nodo
+async function aplicarLogRecibido(log) {
+  try {
+    // Verificar si ya tenemos este log (por el ID o por contenido)
+    const existe = await pool.query(
+      'SELECT id FROM log_replicacion WHERE id = $1 OR (tabla = $2 AND datos = $3 AND nodo_origen = $4)',
+      [log.id, log.tabla, log.datos, log.nodo_origen]
+    );
+    
+    if (existe.rows.length > 0) {
+      console.log(`   ⏭️ Log ${log.id} ya existe, omitiendo`);
+      return;
+    }
+    
+    console.log(`   🔄 Aplicando log ${log.id}: ${log.tabla} - ${log.operacion} desde ${log.nodo_origen}`);
+    
+    // Aplicar el cambio según la tabla
+    if (log.tabla === 'resenas') {
+      const datos = typeof log.datos === 'string' ? JSON.parse(log.datos) : log.datos;
+      
+      // Verificar si la reseña ya existe
+      const existeResena = await pool.query(
+        'SELECT id FROM resenas WHERE id = $1',
+        [datos.id]
       );
-    } else if (cambio.tabla === 'usuarios') {
-      const d = cambio.datos;
-      const existe = await pool.query(
-        'SELECT id FROM usuarios WHERE correo = $1', [d.correo]
-      );
-      if (existe.rows.length === 0) {
+      
+      if (existeResena.rows.length === 0) {
         await pool.query(
-          `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash)
-           VALUES ($1, $2, $3)`,
-          [d.nombre_usuario, d.correo, d.contrasena_hash]
+          `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas, creado_en)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [datos.lugar_id, datos.actividad_id, datos.usuario_id, datos.titulo, datos.comentario, datos.estrellas]
         );
+        console.log(`   ✅ Reseña insertada`);
+      }
+      
+    } else if (log.tabla === 'usuarios') {
+      const datos = typeof log.datos === 'string' ? JSON.parse(log.datos) : log.datos;
+      
+      const existeUsuario = await pool.query(
+        'SELECT id FROM usuarios WHERE correo = $1',
+        [datos.correo]
+      );
+      
+      if (existeUsuario.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash, creado_en)
+           VALUES ($1, $2, $3, NOW())`,
+          [datos.nombre_usuario, datos.correo, datos.contrasena_hash]
+        );
+        console.log(`   ✅ Usuario ${datos.nombre_usuario} insertado`);
       }
     }
+    
+    // Guardar el log localmente también
+    await guardarLog(log.tabla, log.operacion, log.datos, log.nodo_origen);
+    
   } catch (err) {
-    console.warn('Error aplicando cambio:', err.message);
+    console.error(`   ❌ Error aplicando log:`, err.message);
   }
+}
+
+// Sincronización periódica (cada 5 minutos)
+function iniciarSincronizacionPeriodica() {
+  setInterval(async () => {
+    console.log('\n⏰ Sincronización periódica iniciada...');
+    await sincronizarConTodosLosNodos();
+  }, 5 * 60 * 1000); // 5 minutos
 }
 
 // ✅ Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', nodo: NODO_NOMBRE, primario: true });
+  res.json({ status: 'ok', nodo: NODO_NOMBRE });
 });
 
-// ✅ Endpoint de sincronización - devuelve cambios desde un timestamp
+// ✅ Endpoint de sincronización - devuelve logs desde un timestamp
 app.get('/api/replicacion/sync', async (req, res) => {
   try {
     const { desde, nodo } = req.query;
+    const desdeDate = desde ? new Date(desde) : new Date('2024-01-01');
+    
+    console.log(`📥 Solicitud de sync desde ${nodo} (desde: ${desdeDate.toISOString()})`);
+    
     const result = await pool.query(
       `SELECT * FROM log_replicacion 
        WHERE creado_en > $1 AND nodo_origen != $2
        ORDER BY creado_en ASC`,
-      [desde ?? '2024-01-01', nodo ?? '']
+      [desdeDate, nodo]
     );
+    
+    console.log(`📤 Enviando ${result.rows.length} logs a ${nodo}`);
     res.json(result.rows);
+    
+  } catch (err) {
+    console.error('Error en sync:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Endpoint para ver todos los logs (debug)
+app.get('/api/replicacion/logs', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM log_replicacion ORDER BY creado_en DESC LIMIT 100'
+    );
+    res.json({
+      total: result.rows.length,
+      nodo_actual: NODO_NOMBRE,
+      logs: result.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Endpoint para forzar sincronización manual
+app.post('/api/replicacion/sincronizar', async (req, res) => {
+  try {
+    await sincronizarConTodosLosNodos();
+    res.json({ message: 'Sincronización completada', nodo: NODO_NOMBRE });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -397,7 +510,54 @@ app.post('/api/conducta', async (req, res) => {
   }
 });
 
-// ✅ RESEÑAS
+// ✅ RESEÑAS - UN SOLO ENDPOINT
+app.post('/api/resenas', async (req, res) => {
+  try {
+    const esReplicacion = req.headers['x-replicacion'] === 'true';
+    const nodoOrigen = req.headers['x-nodo-origen'];
+    const { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas } = req.body;
+    
+    // Si es replicación, solo insertar y guardar log
+    if (esReplicacion) {
+      const existe = await pool.query(
+        'SELECT id FROM resenas WHERE lugar_id = $1 AND usuario_id = $2 AND titulo = $3',
+        [lugar_id, usuario_id, titulo]
+      );
+      
+      if (existe.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas, creado_en)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
+        );
+        console.log(`✅ Reseña replicada para lugar ${lugar_id}`);
+        
+        // Guardar en log local también
+        await guardarLog('resenas', 'INSERT', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas }, nodoOrigen);
+      }
+      return res.json({ success: true });
+    }
+    
+    // Si NO es replicación, crear nueva reseña
+    const result = await pool.query(
+      `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas, creado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
+      [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
+    );
+    
+    res.json(result.rows[0]);
+    
+    // Guardar log y replicar
+    const datos = { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas };
+    await guardarLog('resenas', 'INSERT', datos);
+    await replicarANodos('/api/resenas', datos, 'resenas', 'INSERT');
+    
+  } catch (err) {
+    console.error('Error en reseñas:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/resenas/region/:id', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -407,12 +567,8 @@ app.get('/api/resenas/region/:id', async (req, res) => {
       LEFT JOIN usuarios u ON r.usuario_id = u.id
       LEFT JOIN lugares l ON r.lugar_id = l.id
       LEFT JOIN actividades a ON r.actividad_id = a.id
-      WHERE r.lugar_id IN (
-        SELECT id FROM lugares WHERE region_id = $1
-      )
-      OR r.actividad_id IN (
-        SELECT id FROM actividades WHERE region_id = $1
-      )
+      WHERE r.lugar_id IN (SELECT id FROM lugares WHERE region_id = $1)
+      OR r.actividad_id IN (SELECT id FROM actividades WHERE region_id = $1)
       ORDER BY r.creado_en DESC
     `, [req.params.id]);
     res.json(result.rows);
@@ -436,25 +592,7 @@ app.get('/api/resenas/lugar/:id', async (req, res) => {
   }
 });
 
-app.post('/api/resenas', async (req, res) => {
-  try {
-    const esReplicacion = req.headers['x-replicacion'] === 'true';
-    const { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas } = req.body;
-    const result = await pool.query(
-      `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
-    );
-    res.json(result.rows[0]);
-
-    if (!esReplicacion) {
-      await guardarLog('resenas', 'INSERT', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
-      replicarANodos('/api/resenas', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-  app.get('/api/resenas/actividad/:id', async (req, res) => {
+app.get('/api/resenas/actividad/:id', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT r.*, u.nombre_usuario, u.foto_url as usuario_foto
@@ -467,7 +605,6 @@ app.post('/api/resenas', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
 });
 
 // ✅ GUIA POR REGIÓN
@@ -500,38 +637,64 @@ app.get('/api/guia/region/:id', async (req, res) => {
   }
 });
 
-// ✅ AUTENTICACIÓN
+// ✅ AUTENTICACIÓN - UN SOLO ENDPOINT
 app.post('/api/auth/registro', async (req, res) => {
   try {
     const esReplicacion = req.headers['x-replicacion'] === 'true';
+    const nodoOrigen = req.headers['x-nodo-origen'];
     const { nombre_usuario, correo, contrasena } = req.body;
 
-    if (!esReplicacion) {
+    // Si es replicación, solo insertar
+    if (esReplicacion) {
       const existe = await pool.query(
         'SELECT id FROM usuarios WHERE correo = $1 OR nombre_usuario = $2',
         [correo, nombre_usuario]
       );
-      if (existe.rows.length > 0) {
-        return res.status(400).json({ error: 'El correo o nombre de usuario ya está en uso' });
+      
+      if (existe.rows.length === 0) {
+        const hash = await bcrypt.hash(contrasena, 10);
+        await pool.query(
+          `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash, creado_en)
+           VALUES ($1, $2, $3, NOW())`,
+          [nombre_usuario, correo, hash]
+        );
+        console.log(`✅ Usuario replicado: ${nombre_usuario}`);
+        
+        // Guardar log de la replicación recibida
+        await guardarLog('usuarios', 'INSERT', { nombre_usuario, correo, contrasena_hash: hash }, nodoOrigen);
       }
+      return res.json({ success: true });
+    }
+
+    // Registro normal
+    const existe = await pool.query(
+      'SELECT id FROM usuarios WHERE correo = $1 OR nombre_usuario = $2',
+      [correo, nombre_usuario]
+    );
+    
+    if (existe.rows.length > 0) {
+      return res.status(400).json({ error: 'El correo o nombre de usuario ya está en uso' });
     }
 
     const hash = await bcrypt.hash(contrasena, 10);
     const result = await pool.query(
-      `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash)
-       VALUES ($1, $2, $3) RETURNING id, nombre_usuario, correo, foto_url`,
+      `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash, creado_en)
+       VALUES ($1, $2, $3, NOW()) RETURNING id, nombre_usuario, correo, foto_url`,
       [nombre_usuario, correo, hash]
     );
 
     const usuario = result.rows[0];
     const token = jwt.sign({ id: usuario.id }, JWT_SECRET, { expiresIn: '30d' });
+    
     res.json({ usuario, token });
-
-    if (!esReplicacion) {
-      await guardarLog('usuarios', 'INSERT', { nombre_usuario, correo, contrasena_hash: hash });
-      replicarANodos('/api/auth/registro', { nombre_usuario, correo, contrasena });
-    }
+    
+    // Guardar log y replicar
+    const datos = { nombre_usuario, correo, contrasena_hash: hash };
+    await guardarLog('usuarios', 'INSERT', datos);
+    await replicarANodos('/api/auth/registro', { nombre_usuario, correo, contrasena }, 'usuarios', 'INSERT');
+    
   } catch (err) {
+    console.error('Error en registro:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -680,8 +843,8 @@ app.post('/api/auth/google', async (req, res) => {
       nombreUsuario = `${nombreUsuario}_${Math.floor(Math.random() * 9000) + 1000}`;
     }
     const nuevoUsuario = await pool.query(
-      `INSERT INTO usuarios (nombre_usuario, correo, google_id, foto_url, proveedor)
-       VALUES ($1, $2, $3, $4, 'google') RETURNING id, nombre_usuario, correo, foto_url`,
+      `INSERT INTO usuarios (nombre_usuario, correo, google_id, foto_url, proveedor, creado_en)
+       VALUES ($1, $2, $3, $4, 'google', NOW()) RETURNING id, nombre_usuario, correo, foto_url`,
       [nombreUsuario, correo, google_id, foto_url]
     );
     const token = jwt.sign({ id: nuevoUsuario.rows[0].id }, JWT_SECRET, { expiresIn: '30d' });
@@ -706,24 +869,40 @@ app.get('/api/replicacion/estado', async (req, res) => {
   const estados = [];
   for (const nodo of NODOS_REPLICAS) {
     try {
-      const response = await fetch(`${nodo}/health`, {
+      const response = await fetch(`${nodo.url}/health`, {
         signal: AbortSignal.timeout(3000)
       });
       const data = await response.json();
-      estados.push({ nodo, estado: 'activo', info: data });
+      estados.push({ nodo: nodo.nombre, url: nodo.url, estado: 'activo', info: data });
     } catch (err) {
-      estados.push({ nodo, estado: 'caido', error: err.message });
+      estados.push({ nodo: nodo.nombre, url: nodo.url, estado: 'caido', error: err.message });
     }
   }
+  
+  // Obtener estadísticas de logs
+  const logStats = await pool.query(`
+    SELECT nodo_origen, COUNT(*) as total_logs, MAX(creado_en) as ultimo_log
+    FROM log_replicacion 
+    GROUP BY nodo_origen
+  `);
+  
   res.json({
     nodo_actual: NODO_NOMBRE,
     url: NODO_URL,
-    replicas: estados
+    replicas: estados,
+    logs_por_nodo: logStats.rows
   });
 });
 
+// Iniciar servidor
 app.listen(process.env.PORT, async () => {
-  console.log(`Nodo ${NODO_NOMBRE} corriendo en puerto ${process.env.PORT}`);
-  // Esperar 5 segundos para que el servidor esté listo antes de sincronizar
-  setTimeout(sincronizarAlArrancar, 5000);
+  console.log(`\n🚀 Nodo ${NODO_NOMBRE} corriendo en puerto ${process.env.PORT}`);
+  console.log(`📋 URL: ${NODO_URL}\n`);
+  
+  // Esperar 5 segundos para que el servidor esté listo
+  setTimeout(async () => {
+    await sincronizarConTodosLosNodos();
+    iniciarSincronizacionPeriodica();
+    console.log('✅ Sistema de replicación inicializado\n');
+  }, 5000);
 });
